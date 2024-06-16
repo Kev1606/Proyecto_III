@@ -4,216 +4,349 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 
 #define PORT 8889
-#define BUF_SIZE 1024
-#define CMD_SIZE 256
+#define BUFFER_SIZE 1024
 
-void *handle_connection(void *arg);
-void *handle_user_input(void *arg);
-void execute_command(int sock, char *command);
-void send_file(int sock, char *filename);
-void receive_file(int sock, char *filename);
+void *handle_client(void *client_socket);
+void *server_thread(void *arg);
+void *client_thread(void *arg);
 
-int server_sock, client_sock;
-struct sockaddr_in server_addr, client_addr;
-socklen_t client_addr_len = sizeof(client_addr);
+char client_current_dir[BUFFER_SIZE];
 
 int main() {
-    pthread_t thread_id;
+    pthread_t server_tid, client_tid;
 
-    // Crear socket del servidor
-    server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) {
-        perror("socket");
+    if (getcwd(client_current_dir, sizeof(client_current_dir)) == NULL) {
+        perror("Error al obtener el directorio actual del cliente");
         exit(EXIT_FAILURE);
     }
 
-    // Configurar dirección del servidor
+    // Crear y lanzar hilo del servidor
+    if (pthread_create(&server_tid, NULL, server_thread, NULL) != 0) {
+        perror("Error al crear el hilo del servidor");
+        exit(EXIT_FAILURE);
+    }
+
+    // Crear y lanzar hilo del cliente
+    if (pthread_create(&client_tid, NULL, client_thread, NULL) != 0) {
+        perror("Error al crear el hilo del cliente");
+        exit(EXIT_FAILURE);
+    }
+
+    // Esperar a que ambos hilos terminen
+    pthread_join(server_tid, NULL);
+    pthread_join(client_tid, NULL);
+
+    return 0;
+}
+
+void *server_thread(void *arg) {
+    int server_socket, client_socket;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    pthread_t thread_id;
+
+    // Crear el socket del servidor
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket < 0) {
+        perror("No se pudo crear el socket del servidor");
+        exit(EXIT_FAILURE);
+    }
+
+    // Configurar la dirección del servidor
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
 
-    // Vincular el socket con la dirección
-    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind");
-        close(server_sock);
+    // Enlazar el socket a la dirección y puerto
+    if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Error al enlazar el socket del servidor a la dirección");
+        close(server_socket);
         exit(EXIT_FAILURE);
     }
 
     // Escuchar conexiones entrantes
-    if (listen(server_sock, 5) < 0) {
-        perror("listen");
-        close(server_sock);
+    if (listen(server_socket, 5) < 0) {
+        perror("No se pudo escuchar en el socket del servidor");
+        close(server_socket);
         exit(EXIT_FAILURE);
     }
 
-    // Crear un thread para manejar el input del usuario
-    pthread_create(&thread_id, NULL, handle_user_input, NULL);
-    pthread_detach(thread_id);
+    printf("Servidor FTP activo en el puerto %d. Esperando conexiones...\n", PORT);
 
-    printf("Servidor FTP esperando conexiones en el puerto %d...\n", PORT);
-
+    // Bucle para aceptar conexiones de clientes
     while (1) {
-        // Aceptar conexiones entrantes
-        client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (client_sock < 0) {
-            perror("accept");
-            close(server_sock);
-            exit(EXIT_FAILURE);
+        client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
+        if (client_socket < 0) {
+            perror("Error al aceptar la conexión del cliente");
+            continue;
         }
 
-        printf("Conexión aceptada de %s\n", inet_ntoa(client_addr.sin_addr));
+        printf("Nuevo cliente conectado\n");
 
-        // Crear un thread para manejar la conexión entrante
-        pthread_create(&thread_id, NULL, handle_connection, (void *)&client_sock);
-        pthread_detach(thread_id);
+        // Crear un hilo para manejar la conexión del cliente
+        if (pthread_create(&thread_id, NULL, handle_client, (void *)&client_socket) != 0) {
+            perror("Error al crear un hilo para manejar al cliente");
+            close(client_socket);
+        } else {
+            pthread_detach(thread_id);  // Separar el hilo
+        }
     }
 
-    close(server_sock);
-    return 0;
+    close(server_socket);
+    return NULL;
 }
 
+void *client_thread(void *arg) {
+    int client_socket = -1;
+    struct sockaddr_in server_addr;
+    char buffer[BUFFER_SIZE];
+    char command[BUFFER_SIZE];
 
+    while (1) {
+        printf("ftp> ");
+        fgets(command, BUFFER_SIZE, stdin);
+        command[strcspn(command, "\n")] = 0;
 
-void *handle_connection(void *arg) {
-    int sock = *(int *)arg;
-    char buffer[BUF_SIZE];
+        char *cmd = strtok(command, " ");
+        char *arg = strtok(NULL, "");
+
+        if (strcmp(cmd, "open") == 0) {
+            if (arg == NULL) {
+                printf("Uso correcto: open <dirección-ip>\n");
+                continue;
+            }
+
+            client_socket = socket(AF_INET, SOCK_STREAM, 0);
+            if (client_socket < 0) {
+                perror("No se pudo crear el socket del cliente");
+                continue;
+            }
+
+            server_addr.sin_family = AF_INET;
+            server_addr.sin_port = htons(PORT);
+            if (inet_pton(AF_INET, arg, &server_addr.sin_addr) <= 0) {
+                perror("Dirección IP no válida");
+                close(client_socket);
+                client_socket = -1;
+                continue;
+            }
+
+            if (connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+                perror("No se pudo conectar al servidor");
+                close(client_socket);
+                client_socket = -1;
+                continue;
+            }
+
+            printf("Conectado al servidor %s en el puerto %d\n", arg, PORT);
+        } else if (strcmp(cmd, "close") == 0) {
+            if (client_socket != -1) {
+                close(client_socket);
+                client_socket = -1;
+                printf("Conexión cerrada\n");
+            } else {
+                printf("No hay ninguna conexión activa\n");
+            }
+        } else if (strcmp(cmd, "quit") == 0) {
+            if (client_socket != -1) {
+                close(client_socket);
+            }
+            printf("Saliendo del programa FTP...\n");
+            exit(0);
+        } else if (strcmp(cmd, "lcd") == 0) {
+            if (arg == NULL) {
+                printf("Uso correcto: lcd <directorio>\n");
+                continue;
+            }
+
+            if (chdir(arg) == 0) {
+                printf("Directorio local cambiado a: %s\n", arg);
+                if (getcwd(client_current_dir, sizeof(client_current_dir)) == NULL) {
+                    perror("No se pudo obtener el nuevo directorio actual");
+                }
+            } else {
+                perror("Error al cambiar el directorio local");
+            }
+        } else if (client_socket == -1) {
+            printf("Debe conectarse a un servidor primero usando el comando 'open <dirección-ip>'\n");
+        } else {
+            if (strcmp(cmd, "put") == 0) {
+                char file_path[BUFFER_SIZE];
+                snprintf(file_path, BUFFER_SIZE, "%s/%s", client_current_dir, arg);
+                FILE *file = fopen(file_path, "rb");
+                if (file == NULL) {
+                    perror("No se pudo abrir el archivo local para enviar");
+                    continue;
+                }
+
+                fseek(file, 0, SEEK_END);
+                long file_size = ftell(file);
+                fseek(file, 0, SEEK_SET);
+                char *file_content = malloc(file_size);
+                fread(file_content, 1, file_size, file);
+                fclose(file);
+
+                snprintf(buffer, BUFFER_SIZE, "put %s %ld", arg, file_size);
+                send(client_socket, buffer, strlen(buffer), 0);
+                send(client_socket, file_content, file_size, 0);
+                free(file_content);
+
+                int bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
+                if (bytes_received > 0) {
+                    buffer[bytes_received] = '\0';
+                    printf("Servidor: %s\n", buffer);
+                }
+            } else if (strcmp(cmd, "get") == 0) {
+                snprintf(buffer, BUFFER_SIZE, "get %s", arg);
+                send(client_socket, buffer, strlen(buffer), 0);
+
+                int bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
+                if (bytes_received > 0) {
+                    buffer[bytes_received] = '\0';
+                    long file_size = atol(buffer);
+
+                    char *file_content = malloc(file_size);
+                    bytes_received = recv(client_socket, file_content, file_size, 0);
+                    if (bytes_received > 0) {
+                        printf("Recibiendo archivo: %s\n", arg);
+
+                        char file_path[BUFFER_SIZE];
+                        snprintf(file_path, BUFFER_SIZE, "%s/%s", client_current_dir, arg);
+                        FILE *file = fopen(file_path, "wb");
+                        if (file == NULL) {
+                            perror("No se pudo crear el archivo local");
+                            free(file_content);
+                            continue;
+                        }
+                        fwrite(file_content, 1, file_size, file);
+                        fclose(file);
+
+                        printf("Archivo %s recibido correctamente\n", arg);
+                    }
+                    free(file_content);
+                }
+            } else {
+                snprintf(buffer, BUFFER_SIZE, "%s %s", cmd, arg ? arg : "");
+                send(client_socket, buffer, strlen(buffer), 0);
+
+                int bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
+                if (bytes_received > 0) {
+                    buffer[bytes_received] = '\0';
+                    printf("Servidor: %s\n", buffer);
+                }
+            }
+        }
+    }
+
+    return NULL;
+}
+
+void *handle_client(void *client_socket) {
+    int socket = *(int *)client_socket;
+    char buffer[BUFFER_SIZE];
     int bytes_read;
+    char server_current_dir[BUFFER_SIZE];
 
-    while ((bytes_read = recv(sock, buffer, BUF_SIZE, 0)) > 0) {
+    if (getcwd(server_current_dir, sizeof(server_current_dir)) == NULL) {
+        perror("No se pudo obtener el directorio actual del servidor");
+        close(socket);
+        return NULL;
+    }
+
+    while ((bytes_read = recv(socket, buffer, BUFFER_SIZE, 0)) > 0) {
         buffer[bytes_read] = '\0';
         printf("Comando recibido: %s\n", buffer);
-        execute_command(sock, buffer);
-    }
 
-    if (bytes_read == 0) {
-        printf("Conexión cerrada por el cliente\n");
-    } else if (bytes_read < 0) {
-        perror("recv");
-    }
+        char *cmd = strtok(buffer, " ");
+        char *arg = strtok(NULL, " ");
+        char response[BUFFER_SIZE];
 
-    close(sock);
-    return NULL;
-}
-
-
-void *handle_user_input(void *arg) {
-    char command[CMD_SIZE];
-    char server_ip[16];
-    int sock;
-    struct sockaddr_in remote_addr;
-
-    while (1) {
-        printf("bftp> ");
-        fgets(command, CMD_SIZE, stdin);
-        command[strcspn(command, "\n")] = '\0'; // Remover newline
-
-        if (strncmp(command, "open ", 5) == 0) {
-            sscanf(command + 5, "%s", server_ip);
-
-            // Crear socket del cliente
-            sock = socket(AF_INET, SOCK_STREAM, 0);
-            if (sock < 0) {
-                perror("socket");
-                continue;
+        if (strcmp(cmd, "cd") == 0) {
+            if (arg == NULL) {
+                snprintf(response, BUFFER_SIZE, "¡Ups! No especificaste un directorio.\n");
+            } else {
+                char new_dir[BUFFER_SIZE];
+                snprintf(new_dir, BUFFER_SIZE, "%s/%s", server_current_dir, arg);
+                if (chdir(new_dir) == 0) {
+                    snprintf(response, BUFFER_SIZE, "¡Perfecto! Cambiado al directorio %s\n", arg);
+                    strcpy(server_current_dir, new_dir);
+                } else {
+                    snprintf(response, BUFFER_SIZE, "Error: No se pudo cambiar al directorio %s\n", arg);
+                }
             }
-
-            // Configurar dirección remota
-            remote_addr.sin_family = AF_INET;
-            remote_addr.sin_addr.s_addr = inet_addr(server_ip);
-            remote_addr.sin_port = htons(PORT);
-
-            // Conectar al servidor remoto
-            if (connect(sock, (struct sockaddr *)&remote_addr, sizeof(remote_addr)) < 0) {
-                perror("connect");
-                close(sock);
-                continue;
+        } else if (strcmp(cmd, "ls") == 0) {
+            DIR *d;
+            struct dirent *dir;
+            d = opendir(server_current_dir);
+            if (d) {
+                response[0] = '\0';
+                while ((dir = readdir(d)) != NULL) {
+                    strcat(response, dir->d_name);
+                    strcat(response, "\n");
+                }
+                closedir(d);
+            } else {
+                snprintf(response, BUFFER_SIZE, "Error: No se pudo listar el directorio\n");
             }
+        } else if (strcmp(cmd, "pwd") == 0) {
+            snprintf(response, BUFFER_SIZE, "Directorio actual: %s\n", server_current_dir);
+        } else if (strcmp(cmd, "get") == 0) {
+            if (arg == NULL) {
+                snprintf(response, BUFFER_SIZE, "¡Ups! No especificaste un archivo para descargar.\n");
+            } else {
+                char file_path[BUFFER_SIZE];
+                snprintf(file_path, BUFFER_SIZE, "%s/%s", server_current_dir, arg);
+                FILE *file = fopen(file_path, "rb");
+                if (file == NULL) {
+                    snprintf(response, BUFFER_SIZE, "Error: El archivo %s no se encontró\n", arg);
+                } else {
+                    fseek(file, 0, SEEK_END);
+                    long file_size = ftell(file);
+                    fseek(file, 0, SEEK_SET);
+                    char *file_content = malloc(file_size);
+                    fread(file_content, 1, file_size, file);
+                    fclose(file);
 
-            printf("Conectado a %s\n", server_ip);
-        } else if (strcmp(command, "close") == 0) {
-            close(sock);
-            printf("Conexión cerrada\n");
-        } else if (strcmp(command, "quit") == 0) {
-            close(sock);
-            exit(0);
+                    snprintf(response, BUFFER_SIZE, "%ld", file_size);
+                    send(socket, response, strlen(response), 0);
+                    send(socket, file_content, file_size, 0);
+                    free(file_content);
+                }
+            }
+        } else if (strcmp(cmd, "put") == 0) {
+            long file_size = atol(arg);
+            char *file_content = malloc(file_size);
+            bytes_read = recv(socket, file_content, file_size, 0);
+
+            if (bytes_read != file_size) {
+                snprintf(response, BUFFER_SIZE, "Error: No se recibió el archivo completo\n");
+                send(socket, response, strlen(response), 0);
+            } else {
+                FILE *file = fopen(buffer, "wb");
+                if (file == NULL) {
+                    snprintf(response, BUFFER_SIZE, "Error: No se pudo crear el archivo en el servidor\n");
+                } else {
+                    fwrite(file_content, 1, file_size, file);
+                    fclose(file);
+                    snprintf(response, BUFFER_SIZE, "Transferencia completada. Archivo %s guardado.\n", buffer);
+                }
+                free(file_content);
+                send(socket, response, strlen(response), 0);
+            }
         } else {
-            // Enviar comando al servidor remoto
-            if (send(sock, command, strlen(command), 0) < 0) {
-                perror("send");
-            }
+            snprintf(response, BUFFER_SIZE, "Error: Comando '%s' no implementado\n", cmd);
+        }
+
+        if (strcmp(cmd, "get") != 0 && strcmp(cmd, "put") != 0) {
+            send(socket, response, strlen(response), 0);
         }
     }
+
+    close(socket);
+    printf("Cliente desconectado\n");
     return NULL;
-}
-
-
-void execute_command(int sock, char *command) {
-    if (strncmp(command, "get ", 4) == 0) {
-        send_file(sock, command + 4);
-    } else if (strncmp(command, "put ", 4) == 0) {
-        receive_file(sock, command + 4);
-    } else if (strcmp(command, "ls") == 0) {
-        DIR *d;
-        struct dirent *dir;
-        char buffer[BUF_SIZE];
-
-        d = opendir(".");
-        if (d) {
-            while ((dir = readdir(d)) != NULL) {
-                snprintf(buffer, BUF_SIZE, "%s\n", dir->d_name);
-                send(sock, buffer, strlen(buffer), 0);
-            }
-            closedir(d);
-        }
-    } else if (strncmp(command, "cd ", 3) == 0) {
-        chdir(command + 3);
-    } else if (strcmp(command, "pwd") == 0) {
-        char cwd[BUF_SIZE];
-        if (getcwd(cwd, sizeof(cwd)) != NULL) {
-            send(sock, cwd, strlen(cwd), 0);
-        }
-    }
-}
-
-void send_file(int sock, char *filename) {
-    int fd;
-    char buffer[BUF_SIZE];
-    int bytes_read;
-
-    fd = open(filename, O_RDONLY);
-    if (fd < 0) {
-        perror("open");
-        return;
-    }
-
-    while ((bytes_read = read(fd, buffer, BUF_SIZE)) > 0) {
-        send(sock, buffer, bytes_read, 0);
-    }
-
-    close(fd);
-}
-
-void receive_file(int sock, char *filename) {
-    int fd;
-    char buffer[BUF_SIZE];
-    int bytes_read;
-
-    fd = open(filename, O_WRONLY | O_CREAT, 0644);
-    if (fd < 0) {
-        perror("open");
-        return;
-    }
-
-    while ((bytes_read = recv(sock, buffer, BUF_SIZE, 0)) > 0) {
-        write(fd, buffer, bytes_read);
-    }
-
-    close(fd);
 }
